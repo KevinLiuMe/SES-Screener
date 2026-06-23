@@ -1,0 +1,1830 @@
+# ============================================================
+# STRATEGIC EQUITY OPPORTUNITY RADAR
+# FULL BQUANT FRONT END
+#
+# Run this cell AFTER defining:
+#
+#   1. run_opportunity_screen(...)
+#   2. collar_payoff(...)
+#
+# Required columns in results:
+#
+#   Ticker
+#   Price
+#   Pct_Below_52W_High
+#   Realized_Vol_20D
+#   Return_3M
+#   Average_Volume_20D
+#   Average_Daily_Value_Traded_20D
+#   Opportunity_Score
+#   Why_Flagged
+#
+# Optional columns:
+#
+#   52W_High
+#   52W_Low
+#   Realized_Vol_60D
+#   Return_6M
+#   Return_1Y
+#   Volume_Observation_Count
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. IMPORTS
+# ------------------------------------------------------------
+
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import ipywidgets as widgets
+
+from IPython.display import display, clear_output
+
+
+# ------------------------------------------------------------
+# 2. APPLICATION STATE
+# ------------------------------------------------------------
+
+app_state = {
+    "results": None,
+    "history": None,
+    "selected_ticker": None,
+}
+
+
+# ------------------------------------------------------------
+# 3. APPLICATION COLORS
+# ------------------------------------------------------------
+
+COLORS = {
+    "background": "#101214",
+    "panel": "#191c20",
+    "panel_secondary": "#22262b",
+    "border": "#3b4047",
+    "text": "#f0f0f0",
+    "muted": "#a8adb4",
+    "yellow": "#f5b400",
+    "green": "#3ecf78",
+    "red": "#ff6262",
+    "blue": "#50a5ff",
+}
+
+
+# ------------------------------------------------------------
+# 4. GENERAL HELPERS
+# ------------------------------------------------------------
+
+def parse_tickers(text):
+    """
+    Convert one-ticker-per-line input into a unique list.
+    """
+    tickers = []
+
+    for line in text.splitlines():
+        ticker = line.strip()
+
+        if ticker:
+            tickers.append(ticker)
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(tickers))
+
+
+def safe_number(value, default=np.nan):
+    """
+    Safely convert a value to float.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_metric(row, column, default=np.nan):
+    """
+    Safely retrieve a metric from a pandas row.
+    """
+    if column not in row.index:
+        return default
+
+    return row[column]
+
+
+def format_money(value, decimals=2):
+    if pd.isna(value):
+        return "N/A"
+
+    return f"${value:,.{decimals}f}"
+
+
+def format_percent(value, decimals=1):
+    if pd.isna(value):
+        return "N/A"
+
+    return f"{value:.{decimals}%}"
+
+
+def format_number(value, decimals=1):
+    if pd.isna(value):
+        return "N/A"
+
+    return f"{value:,.{decimals}f}"
+
+
+def format_integer(value):
+    if pd.isna(value):
+        return "N/A"
+
+    return f"{value:,.0f}"
+
+
+def normalize_weights(
+    high_weight,
+    volatility_weight,
+    return_weight,
+    liquidity_weight,
+):
+    """
+    Return normalized weights that sum to one.
+    """
+    raw_weights = np.array(
+        [
+            high_weight,
+            volatility_weight,
+            return_weight,
+            liquidity_weight,
+        ],
+        dtype=float,
+    )
+
+    total = raw_weights.sum()
+
+    if total <= 0:
+        raise ValueError(
+            "At least one factor weight must be greater than zero."
+        )
+
+    normalized = raw_weights / total
+
+    return {
+        "high_proximity": normalized[0],
+        "realized_volatility": normalized[1],
+        "recent_return": normalized[2],
+        "liquidity": normalized[3],
+    }
+
+
+# ------------------------------------------------------------
+# 5. TABLE FORMATTING
+# ------------------------------------------------------------
+
+def format_results_table(results, top_n):
+    """
+    Build a readable display table from the raw results.
+    """
+    required_columns = [
+        "Ticker",
+        "Price",
+        "Pct_Below_52W_High",
+        "Realized_Vol_20D",
+        "Return_3M",
+        "Average_Volume_20D",
+        "Average_Daily_Value_Traded_20D",
+        "Opportunity_Score",
+        "Why_Flagged",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in results.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The results dataframe is missing these columns: "
+            + ", ".join(missing_columns)
+        )
+
+    table = (
+        results
+        .head(top_n)
+        .loc[:, required_columns]
+        .copy()
+    )
+
+    table["Price"] = table["Price"].round(2)
+
+    table["Pct_Below_52W_High"] = (
+        table["Pct_Below_52W_High"]
+        .round(1)
+    )
+
+    table["Realized_Vol_20D"] = (
+        table["Realized_Vol_20D"]
+        * 100
+    ).round(1)
+
+    table["Return_3M"] = (
+        table["Return_3M"]
+        * 100
+    ).round(1)
+
+    table["Average_Volume_20D"] = (
+        table["Average_Volume_20D"]
+        / 1_000_000
+    ).round(2)
+
+    table["Average_Daily_Value_Traded_20D"] = (
+        table["Average_Daily_Value_Traded_20D"]
+        / 1_000_000
+    ).round(1)
+
+    table["Opportunity_Score"] = (
+        table["Opportunity_Score"]
+        .round(1)
+    )
+
+    table = table.rename(
+        columns={
+            "Pct_Below_52W_High":
+                "% Below 52W High",
+
+            "Realized_Vol_20D":
+                "20D Realized Vol (%)",
+
+            "Return_3M":
+                "3M Return (%)",
+
+            "Average_Volume_20D":
+                "20D Avg Volume (mm)",
+
+            "Average_Daily_Value_Traded_20D":
+                "20D Avg Value Traded ($mm)",
+
+            "Opportunity_Score":
+                "Score",
+
+            "Why_Flagged":
+                "Why Flagged",
+        }
+    )
+
+    table.index = range(1, len(table) + 1)
+    table.index.name = "Rank"
+
+    return table
+
+
+def style_results_table(table):
+    """
+    Apply simple Bloomberg-style formatting to a pandas table.
+    """
+    return (
+        table.style
+        .set_properties(
+            **{
+                "background-color": COLORS["panel"],
+                "color": COLORS["text"],
+                "border-color": COLORS["border"],
+                "font-size": "12px",
+                "padding": "7px",
+                "text-align": "left",
+            }
+        )
+        .set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", COLORS["panel_secondary"]),
+                        ("color", COLORS["yellow"]),
+                        ("border", f"1px solid {COLORS['border']}"),
+                        ("font-weight", "bold"),
+                        ("padding", "8px"),
+                        ("text-align", "left"),
+                    ],
+                },
+                {
+                    "selector": "td",
+                    "props": [
+                        ("border", f"1px solid {COLORS['border']}"),
+                    ],
+                },
+                {
+                    "selector": "caption",
+                    "props": [
+                        ("color", COLORS["yellow"]),
+                        ("font-size", "14px"),
+                        ("font-weight", "bold"),
+                    ],
+                },
+            ]
+        )
+        .format(
+            {
+                "Price": "{:,.2f}",
+                "% Below 52W High": "{:,.1f}",
+                "20D Realized Vol (%)": "{:,.1f}",
+                "3M Return (%)": "{:,.1f}",
+                "20D Avg Volume (mm)": "{:,.2f}",
+                "20D Avg Value Traded ($mm)": "{:,.1f}",
+                "Score": "{:,.1f}",
+            },
+            na_rep="N/A",
+        )
+    )
+
+
+# ------------------------------------------------------------
+# 6. RANKING CHART
+# ------------------------------------------------------------
+
+def create_ranking_chart(results, top_n):
+    """
+    Create the horizontal opportunity-score ranking chart.
+    """
+    chart_data = (
+        results
+        .dropna(subset=["Opportunity_Score"])
+        .head(top_n)
+        .sort_values(
+            "Opportunity_Score",
+            ascending=True,
+        )
+        .copy()
+    )
+
+    figure = go.Figure()
+
+    figure.add_trace(
+        go.Bar(
+            x=chart_data["Opportunity_Score"],
+            y=chart_data["Ticker"],
+            orientation="h",
+            text=chart_data[
+                "Opportunity_Score"
+            ].round(1),
+            textposition="outside",
+            marker=dict(
+                color=chart_data["Opportunity_Score"],
+                colorscale=[
+                    [0.0, "#38424d"],
+                    [0.5, "#92701d"],
+                    [1.0, COLORS["yellow"]],
+                ],
+                showscale=False,
+            ),
+            customdata=chart_data[
+                [
+                    "Pct_Below_52W_High",
+                    "Realized_Vol_20D",
+                    "Return_3M",
+                    "Average_Volume_20D",
+                    "Average_Daily_Value_Traded_20D",
+                    "Why_Flagged",
+                ]
+            ],
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Opportunity score: %{x:.1f}<br>"
+                "Below 52W high: %{customdata[0]:.1f}%<br>"
+                "20D realized vol: %{customdata[1]:.1%}<br>"
+                "Three-month return: %{customdata[2]:.1%}<br>"
+                "20D avg volume: %{customdata[3]:,.0f}<br>"
+                "Avg value traded: $%{customdata[4]:,.0f}<br>"
+                "%{customdata[5]}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    figure.update_layout(
+        title=dict(
+            text="Strategic Equity Opportunity Ranking",
+            font=dict(
+                color=COLORS["yellow"],
+                size=18,
+            ),
+        ),
+        xaxis=dict(
+            title="Opportunity Score",
+            range=[
+                0,
+                max(
+                    100,
+                    chart_data["Opportunity_Score"].max() * 1.12
+                    if not chart_data.empty
+                    else 100,
+                ),
+            ],
+            gridcolor=COLORS["border"],
+            color=COLORS["text"],
+        ),
+        yaxis=dict(
+            title="",
+            color=COLORS["text"],
+        ),
+        paper_bgcolor=COLORS["background"],
+        plot_bgcolor=COLORS["panel"],
+        font=dict(
+            color=COLORS["text"],
+        ),
+        height=max(
+            450,
+            len(chart_data) * 48,
+        ),
+        margin=dict(
+            l=130,
+            r=80,
+            t=70,
+            b=60,
+        ),
+    )
+
+    return figure
+
+
+# ------------------------------------------------------------
+# 7. COLLAR PAYOFF CHART
+# ------------------------------------------------------------
+
+def create_collar_chart(
+    ticker,
+    spot,
+    put_strike_pct,
+    call_strike_pct,
+    shares,
+):
+    """
+    Create the selected-security collar payoff chart.
+    """
+    put_strike = spot * put_strike_pct
+    call_strike = spot * call_strike_pct
+
+    payoff = collar_payoff(
+        spot=spot,
+        put_strike=put_strike,
+        call_strike=call_strike,
+        shares=shares,
+        put_premium=0.0,
+        call_premium=0.0,
+    )
+
+    figure = go.Figure()
+
+    figure.add_trace(
+        go.Scatter(
+            x=payoff["Terminal_Stock_Price"],
+            y=payoff["Unhedged_Value"],
+            mode="lines",
+            name="Unhedged Position",
+            line=dict(
+                color=COLORS["muted"],
+                width=2,
+                dash="dot",
+            ),
+            hovertemplate=(
+                "Terminal stock price: $%{x:,.2f}<br>"
+                "Unhedged value: $%{y:,.0f}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    figure.add_trace(
+        go.Scatter(
+            x=payoff["Terminal_Stock_Price"],
+            y=payoff["Collar_Value"],
+            mode="lines",
+            name="Collared Position",
+            line=dict(
+                color=COLORS["yellow"],
+                width=3,
+            ),
+            hovertemplate=(
+                "Terminal stock price: $%{x:,.2f}<br>"
+                "Collar value: $%{y:,.0f}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    figure.add_vline(
+        x=spot,
+        line_dash="dot",
+        line_color=COLORS["blue"],
+        annotation_text="Spot",
+        annotation_font_color=COLORS["blue"],
+    )
+
+    figure.add_vline(
+        x=put_strike,
+        line_dash="dash",
+        line_color=COLORS["green"],
+        annotation_text="Put Strike",
+        annotation_font_color=COLORS["green"],
+    )
+
+    figure.add_vline(
+        x=call_strike,
+        line_dash="dash",
+        line_color=COLORS["red"],
+        annotation_text="Call Strike",
+        annotation_font_color=COLORS["red"],
+    )
+
+    figure.update_layout(
+        title=dict(
+            text=(
+                f"{ticker} — Illustrative "
+                f"{put_strike_pct:.0%}/"
+                f"{call_strike_pct:.0%} Collar"
+            ),
+            font=dict(
+                color=COLORS["yellow"],
+                size=18,
+            ),
+        ),
+        xaxis=dict(
+            title="Stock Price at Maturity",
+            gridcolor=COLORS["border"],
+            color=COLORS["text"],
+        ),
+        yaxis=dict(
+            title="Terminal Position Value",
+            gridcolor=COLORS["border"],
+            color=COLORS["text"],
+            tickformat="$,.0f",
+        ),
+        paper_bgcolor=COLORS["background"],
+        plot_bgcolor=COLORS["panel"],
+        font=dict(
+            color=COLORS["text"],
+        ),
+        hovermode="x unified",
+        height=540,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+        ),
+        margin=dict(
+            l=90,
+            r=50,
+            t=100,
+            b=70,
+        ),
+    )
+
+    return figure
+
+
+# ------------------------------------------------------------
+# 8. FACTOR PROFILE CHART
+# ------------------------------------------------------------
+
+def create_factor_chart(row):
+    """
+    Show the selected security's component factor scores.
+    """
+    factor_columns = [
+        "High_Proximity_Score",
+        "Volatility_Score",
+        "Recent_Return_Score",
+        "Liquidity_Score",
+    ]
+
+    factor_labels = [
+        "52W High Proximity",
+        "Realized Volatility",
+        "Recent Return",
+        "Liquidity",
+    ]
+
+    values = [
+        safe_metric(row, column)
+        for column in factor_columns
+    ]
+
+    figure = go.Figure()
+
+    figure.add_trace(
+        go.Bar(
+            x=factor_labels,
+            y=values,
+            text=[
+                f"{value:.1f}"
+                if pd.notna(value)
+                else "N/A"
+                for value in values
+            ],
+            textposition="outside",
+            marker=dict(
+                color=COLORS["yellow"],
+            ),
+            hovertemplate=(
+                "%{x}<br>"
+                "Factor score: %{y:.1f}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    figure.update_layout(
+        title=dict(
+            text="Factor Profile",
+            font=dict(
+                color=COLORS["yellow"],
+                size=16,
+            ),
+        ),
+        yaxis=dict(
+            title="Percentile Score",
+            range=[0, 110],
+            gridcolor=COLORS["border"],
+            color=COLORS["text"],
+        ),
+        xaxis=dict(
+            color=COLORS["text"],
+        ),
+        paper_bgcolor=COLORS["background"],
+        plot_bgcolor=COLORS["panel"],
+        font=dict(
+            color=COLORS["text"],
+        ),
+        height=350,
+        margin=dict(
+            l=70,
+            r=40,
+            t=70,
+            b=80,
+        ),
+    )
+
+    return figure
+
+
+# ------------------------------------------------------------
+# 9. SCENARIO TABLE
+# ------------------------------------------------------------
+
+def create_scenario_table(
+    spot,
+    put_strike_pct,
+    call_strike_pct,
+    shares,
+):
+    """
+    Create a simple terminal-value scenario table.
+    """
+    put_strike = spot * put_strike_pct
+    call_strike = spot * call_strike_pct
+
+    scenario_prices = [
+        spot * 0.50,
+        spot * 0.75,
+        put_strike,
+        spot,
+        call_strike,
+        spot * 1.25,
+        spot * 1.50,
+    ]
+
+    scenario_rows = []
+
+    for terminal_price in scenario_prices:
+
+        unhedged_value = terminal_price * shares
+
+        collar_value = (
+            terminal_price
+            + max(
+                put_strike - terminal_price,
+                0,
+            )
+            - max(
+                terminal_price - call_strike,
+                0,
+            )
+        ) * shares
+
+        scenario_rows.append(
+            {
+                "Terminal Stock Price": terminal_price,
+                "Unhedged Value": unhedged_value,
+                "Collar Value": collar_value,
+                "Collar Minus Unhedged": (
+                    collar_value - unhedged_value
+                ),
+            }
+        )
+
+    scenario_table = pd.DataFrame(
+        scenario_rows
+    )
+
+    return scenario_table
+
+
+# ------------------------------------------------------------
+# 10. HEADER
+# ------------------------------------------------------------
+
+header_widget = widgets.HTML(
+    value=f"""
+    <div style="
+        background:{COLORS['background']};
+        border:1px solid {COLORS['border']};
+        border-bottom:4px solid {COLORS['yellow']};
+        padding:16px 20px;
+        font-family:Arial, sans-serif;
+    ">
+        <div style="
+            color:{COLORS['yellow']};
+            font-size:24px;
+            font-weight:700;
+            letter-spacing:0.5px;
+        ">
+            STRATEGIC EQUITY OPPORTUNITY RADAR
+        </div>
+
+        <div style="
+            color:{COLORS['muted']};
+            font-size:12px;
+            margin-top:5px;
+        ">
+            Collar, concentrated-position and monetization idea generation
+        </div>
+    </div>
+    """
+)
+
+
+# ------------------------------------------------------------
+# 11. INPUT CONTROLS
+# ------------------------------------------------------------
+
+ticker_input = widgets.Textarea(
+    value=(
+        "AAPL US Equity\n"
+        "MSFT US Equity\n"
+        "AMZN US Equity\n"
+        "META US Equity\n"
+        "NVDA US Equity\n"
+        "GOOGL US Equity\n"
+        "TSLA US Equity\n"
+        "EQIX US Equity\n"
+        "CRM US Equity\n"
+        "AVGO US Equity"
+    ),
+    description="Universe",
+    layout=widgets.Layout(
+        width="340px",
+        height="185px",
+    ),
+    style={
+        "description_width": "90px",
+    },
+)
+
+
+top_n_input = widgets.IntSlider(
+    value=10,
+    min=3,
+    max=30,
+    step=1,
+    description="Top Names",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+high_weight_input = widgets.FloatSlider(
+    value=0.35,
+    min=0,
+    max=1,
+    step=0.05,
+    description="52W Proximity",
+    readout_format=".0%",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+volatility_weight_input = widgets.FloatSlider(
+    value=0.35,
+    min=0,
+    max=1,
+    step=0.05,
+    description="Volatility",
+    readout_format=".0%",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+return_weight_input = widgets.FloatSlider(
+    value=0.15,
+    min=0,
+    max=1,
+    step=0.05,
+    description="3M Return",
+    readout_format=".0%",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+liquidity_weight_input = widgets.FloatSlider(
+    value=0.15,
+    min=0,
+    max=1,
+    step=0.05,
+    description="Liquidity",
+    readout_format=".0%",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+put_strike_input = widgets.FloatSlider(
+    value=0.90,
+    min=0.70,
+    max=1.00,
+    step=0.01,
+    description="Put Strike",
+    readout_format=".0%",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+call_strike_input = widgets.FloatSlider(
+    value=1.15,
+    min=1.00,
+    max=1.50,
+    step=0.01,
+    description="Call Strike",
+    readout_format=".0%",
+    continuous_update=False,
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+shares_input = widgets.IntText(
+    value=1_000_000,
+    description="Shares",
+    layout=widgets.Layout(
+        width="340px",
+    ),
+    style={
+        "description_width": "105px",
+    },
+)
+
+
+security_selector = widgets.Dropdown(
+    options=[],
+    description="Security",
+    layout=widgets.Layout(
+        width="420px",
+    ),
+    style={
+        "description_width": "80px",
+    },
+)
+
+
+run_button = widgets.Button(
+    description="RUN SCREEN",
+    icon="refresh",
+    button_style="warning",
+    tooltip="Run the Bloomberg opportunity screen",
+    layout=widgets.Layout(
+        width="340px",
+        height="44px",
+    ),
+)
+
+
+reset_button = widgets.Button(
+    description="RESET INPUTS",
+    icon="undo",
+    tooltip="Reset dashboard controls",
+    layout=widgets.Layout(
+        width="165px",
+        height="38px",
+    ),
+)
+
+
+export_button = widgets.Button(
+    description="EXPORT CSV",
+    icon="download",
+    tooltip="Export the current ranked results",
+    layout=widgets.Layout(
+        width="165px",
+        height="38px",
+    ),
+)
+
+
+status_widget = widgets.HTML(
+    value=(
+        f"<span style='color:{COLORS['muted']};'>"
+        "Ready."
+        "</span>"
+    )
+)
+
+
+weight_total_widget = widgets.HTML()
+
+
+# ------------------------------------------------------------
+# 12. OUTPUT CONTAINERS
+# ------------------------------------------------------------
+
+table_output = widgets.Output(
+    layout=widgets.Layout(
+        border=f"1px solid {COLORS['border']}",
+        padding="10px",
+        width="100%",
+        min_height="300px",
+    )
+)
+
+
+ranking_output = widgets.Output(
+    layout=widgets.Layout(
+        border=f"1px solid {COLORS['border']}",
+        padding="6px",
+        width="100%",
+        min_height="450px",
+    )
+)
+
+
+security_summary_output = widgets.Output(
+    layout=widgets.Layout(
+        border=f"1px solid {COLORS['border']}",
+        padding="12px",
+        width="100%",
+    )
+)
+
+
+factor_output = widgets.Output(
+    layout=widgets.Layout(
+        border=f"1px solid {COLORS['border']}",
+        padding="6px",
+        width="100%",
+    )
+)
+
+
+payoff_output = widgets.Output(
+    layout=widgets.Layout(
+        border=f"1px solid {COLORS['border']}",
+        padding="6px",
+        width="100%",
+        min_height="500px",
+    )
+)
+
+
+scenario_output = widgets.Output(
+    layout=widgets.Layout(
+        border=f"1px solid {COLORS['border']}",
+        padding="10px",
+        width="100%",
+    )
+)
+
+
+message_output = widgets.Output(
+    layout=widgets.Layout(
+        width="100%",
+    )
+)
+
+
+# ------------------------------------------------------------
+# 13. SECTION HEADERS
+# ------------------------------------------------------------
+
+def section_header(title):
+    return widgets.HTML(
+        value=f"""
+        <div style="
+            color:{COLORS['yellow']};
+            font-size:13px;
+            font-weight:700;
+            border-bottom:1px solid {COLORS['border']};
+            padding-bottom:6px;
+            margin-top:8px;
+            margin-bottom:8px;
+            letter-spacing:0.4px;
+        ">
+            {title}
+        </div>
+        """
+    )
+
+
+# ------------------------------------------------------------
+# 14. WEIGHT DISPLAY
+# ------------------------------------------------------------
+
+def update_weight_total(change=None):
+    total = (
+        high_weight_input.value
+        + volatility_weight_input.value
+        + return_weight_input.value
+        + liquidity_weight_input.value
+    )
+
+    if np.isclose(total, 1.0):
+        color = COLORS["green"]
+    else:
+        color = COLORS["yellow"]
+
+    weight_total_widget.value = f"""
+    <div style="
+        color:{color};
+        font-size:12px;
+        margin:4px 0 8px 105px;
+    ">
+        Raw weight total: {total:.0%}.
+        Weights will be normalized automatically.
+    </div>
+    """
+
+
+for weight_widget in [
+    high_weight_input,
+    volatility_weight_input,
+    return_weight_input,
+    liquidity_weight_input,
+]:
+    weight_widget.observe(
+        update_weight_total,
+        names="value",
+    )
+
+
+update_weight_total()
+
+
+# ------------------------------------------------------------
+# 15. SECURITY SUMMARY
+# ------------------------------------------------------------
+
+def display_security_summary(row):
+    ticker = row["Ticker"]
+
+    cards = [
+        (
+            "Current Price",
+            format_money(
+                safe_metric(row, "Price")
+            ),
+        ),
+        (
+            "Opportunity Score",
+            format_number(
+                safe_metric(row, "Opportunity_Score"),
+                decimals=1,
+            ),
+        ),
+        (
+            "Below 52W High",
+            (
+                format_number(
+                    safe_metric(
+                        row,
+                        "Pct_Below_52W_High",
+                    ),
+                    decimals=1,
+                )
+                + "%"
+                if pd.notna(
+                    safe_metric(
+                        row,
+                        "Pct_Below_52W_High",
+                    )
+                )
+                else "N/A"
+            ),
+        ),
+        (
+            "20D Realized Vol",
+            format_percent(
+                safe_metric(
+                    row,
+                    "Realized_Vol_20D",
+                )
+            ),
+        ),
+        (
+            "3M Return",
+            format_percent(
+                safe_metric(
+                    row,
+                    "Return_3M",
+                )
+            ),
+        ),
+        (
+            "20D Avg Volume",
+            format_integer(
+                safe_metric(
+                    row,
+                    "Average_Volume_20D",
+                )
+            ),
+        ),
+    ]
+
+    card_html = ""
+
+    for label, value in cards:
+        card_html += f"""
+        <div style="
+            background:{COLORS['panel_secondary']};
+            border:1px solid {COLORS['border']};
+            padding:10px 12px;
+            min-width:135px;
+            flex:1;
+        ">
+            <div style="
+                color:{COLORS['muted']};
+                font-size:10px;
+                text-transform:uppercase;
+            ">
+                {label}
+            </div>
+
+            <div style="
+                color:{COLORS['text']};
+                font-size:18px;
+                font-weight:700;
+                margin-top:4px;
+            ">
+                {value}
+            </div>
+        </div>
+        """
+
+    reason = safe_metric(
+        row,
+        "Why_Flagged",
+        default="No explanation available.",
+    )
+
+    summary_html = f"""
+    <div style="
+        font-family:Arial, sans-serif;
+        background:{COLORS['panel']};
+        color:{COLORS['text']};
+    ">
+        <div style="
+            color:{COLORS['yellow']};
+            font-size:19px;
+            font-weight:700;
+            margin-bottom:10px;
+        ">
+            {ticker}
+        </div>
+
+        <div style="
+            display:flex;
+            gap:8px;
+            flex-wrap:wrap;
+        ">
+            {card_html}
+        </div>
+
+        <div style="
+            background:{COLORS['background']};
+            border-left:4px solid {COLORS['yellow']};
+            padding:10px 12px;
+            margin-top:12px;
+            color:{COLORS['text']};
+            font-size:12px;
+        ">
+            <strong>Why flagged:</strong> {reason}
+        </div>
+    </div>
+    """
+
+    display(
+        widgets.HTML(
+            value=summary_html
+        )
+    )
+
+
+# ------------------------------------------------------------
+# 16. SELECTED SECURITY UPDATE
+# ------------------------------------------------------------
+
+def update_selected_security(change=None):
+    results = app_state.get("results")
+
+    if results is None:
+        return
+
+    ticker = security_selector.value
+
+    if not ticker:
+        return
+
+    selected = results[
+        results["Ticker"] == ticker
+    ]
+
+    if selected.empty:
+        return
+
+    row = selected.iloc[0]
+
+    app_state["selected_ticker"] = ticker
+
+    spot = safe_number(
+        row["Price"]
+    )
+
+    if pd.isna(spot):
+        return
+
+    with security_summary_output:
+        clear_output(wait=True)
+        display_security_summary(row)
+
+    with factor_output:
+        clear_output(wait=True)
+
+        factor_figure = create_factor_chart(
+            row
+        )
+
+        factor_figure.show()
+
+    with payoff_output:
+        clear_output(wait=True)
+
+        payoff_figure = create_collar_chart(
+            ticker=ticker,
+            spot=spot,
+            put_strike_pct=put_strike_input.value,
+            call_strike_pct=call_strike_input.value,
+            shares=shares_input.value,
+        )
+
+        payoff_figure.show()
+
+    with scenario_output:
+        clear_output(wait=True)
+
+        scenario_table = create_scenario_table(
+            spot=spot,
+            put_strike_pct=put_strike_input.value,
+            call_strike_pct=call_strike_input.value,
+            shares=shares_input.value,
+        )
+
+        styled_scenario_table = (
+            scenario_table.style
+            .set_properties(
+                **{
+                    "background-color": COLORS["panel"],
+                    "color": COLORS["text"],
+                    "border-color": COLORS["border"],
+                    "padding": "8px",
+                }
+            )
+            .set_table_styles(
+                [
+                    {
+                        "selector": "th",
+                        "props": [
+                            (
+                                "background-color",
+                                COLORS["panel_secondary"],
+                            ),
+                            (
+                                "color",
+                                COLORS["yellow"],
+                            ),
+                            (
+                                "border",
+                                f"1px solid {COLORS['border']}",
+                            ),
+                            (
+                                "padding",
+                                "8px",
+                            ),
+                        ],
+                    }
+                ]
+            )
+            .format(
+                {
+                    "Terminal Stock Price": "${:,.2f}",
+                    "Unhedged Value": "${:,.0f}",
+                    "Collar Value": "${:,.0f}",
+                    "Collar Minus Unhedged": "${:,.0f}",
+                }
+            )
+        )
+
+        display(
+            styled_scenario_table
+        )
+
+
+# ------------------------------------------------------------
+# 17. RUN SCREEN CALLBACK
+# ------------------------------------------------------------
+
+def refresh_dashboard(button=None):
+    run_button.disabled = True
+    export_button.disabled = True
+
+    status_widget.value = (
+        f"<span style='color:{COLORS['yellow']};'>"
+        "Running Bloomberg screen..."
+        "</span>"
+    )
+
+    with message_output:
+        clear_output(wait=True)
+
+    try:
+        tickers = parse_tickers(
+            ticker_input.value
+        )
+
+        if not tickers:
+            raise ValueError(
+                "Enter at least one Bloomberg ticker."
+            )
+
+        normalized_weights = normalize_weights(
+            high_weight=high_weight_input.value,
+            volatility_weight=volatility_weight_input.value,
+            return_weight=return_weight_input.value,
+            liquidity_weight=liquidity_weight_input.value,
+        )
+
+        results, history = run_opportunity_screen(
+            tickers=tickers,
+            top_n=top_n_input.value,
+            high_proximity_weight=(
+                normalized_weights[
+                    "high_proximity"
+                ]
+            ),
+            volatility_weight=(
+                normalized_weights[
+                    "realized_volatility"
+                ]
+            ),
+            return_weight=(
+                normalized_weights[
+                    "recent_return"
+                ]
+            ),
+            liquidity_weight=(
+                normalized_weights[
+                    "liquidity"
+                ]
+            ),
+        )
+
+        if results is None or results.empty:
+            raise ValueError(
+                "The screen returned no usable results."
+            )
+
+        results = (
+            results
+            .sort_values(
+                "Opportunity_Score",
+                ascending=False,
+                na_position="last",
+            )
+            .reset_index(drop=True)
+        )
+
+        app_state["results"] = results
+        app_state["history"] = history
+
+        ticker_options = (
+            results["Ticker"]
+            .dropna()
+            .astype(str)
+            .tolist()
+        )
+
+        security_selector.options = ticker_options
+
+        with table_output:
+            clear_output(wait=True)
+
+            formatted_table = format_results_table(
+                results=results,
+                top_n=top_n_input.value,
+            )
+
+            display(
+                style_results_table(
+                    formatted_table
+                )
+            )
+
+        with ranking_output:
+            clear_output(wait=True)
+
+            ranking_figure = create_ranking_chart(
+                results=results,
+                top_n=top_n_input.value,
+            )
+
+            ranking_figure.show()
+
+        if ticker_options:
+            security_selector.value = ticker_options[0]
+            update_selected_security()
+
+        status_widget.value = (
+            f"<span style='color:{COLORS['green']};'>"
+            f"Complete — {len(results)} securities analyzed."
+            "</span>"
+        )
+
+        export_button.disabled = False
+
+    except Exception as error:
+        status_widget.value = (
+            f"<span style='color:{COLORS['red']};'>"
+            f"Error: {type(error).__name__}"
+            "</span>"
+        )
+
+        with message_output:
+            clear_output(wait=True)
+
+            print(
+                f"{type(error).__name__}: {error}"
+            )
+
+    finally:
+        run_button.disabled = False
+
+
+# ------------------------------------------------------------
+# 18. RESET CALLBACK
+# ------------------------------------------------------------
+
+def reset_dashboard(button=None):
+    ticker_input.value = (
+        "AAPL US Equity\n"
+        "MSFT US Equity\n"
+        "AMZN US Equity\n"
+        "META US Equity\n"
+        "NVDA US Equity\n"
+        "GOOGL US Equity\n"
+        "TSLA US Equity\n"
+        "EQIX US Equity\n"
+        "CRM US Equity\n"
+        "AVGO US Equity"
+    )
+
+    top_n_input.value = 10
+
+    high_weight_input.value = 0.35
+    volatility_weight_input.value = 0.35
+    return_weight_input.value = 0.15
+    liquidity_weight_input.value = 0.15
+
+    put_strike_input.value = 0.90
+    call_strike_input.value = 1.15
+    shares_input.value = 1_000_000
+
+    status_widget.value = (
+        f"<span style='color:{COLORS['muted']};'>"
+        "Inputs reset."
+        "</span>"
+    )
+
+
+# ------------------------------------------------------------
+# 19. EXPORT CALLBACK
+# ------------------------------------------------------------
+
+def export_results(button=None):
+    results = app_state.get("results")
+
+    if results is None or results.empty:
+        status_widget.value = (
+            f"<span style='color:{COLORS['red']};'>"
+            "No results available to export."
+            "</span>"
+        )
+        return
+
+    filename = (
+        "strategic_equity_opportunity_screen.csv"
+    )
+
+    results.to_csv(
+        filename,
+        index=False,
+    )
+
+    status_widget.value = (
+        f"<span style='color:{COLORS['green']};'>"
+        f"Exported to {filename}"
+        "</span>"
+    )
+
+
+# ------------------------------------------------------------
+# 20. REGISTER EVENTS
+# ------------------------------------------------------------
+
+run_button.on_click(
+    refresh_dashboard
+)
+
+reset_button.on_click(
+    reset_dashboard
+)
+
+export_button.on_click(
+    export_results
+)
+
+security_selector.observe(
+    update_selected_security,
+    names="value",
+)
+
+put_strike_input.observe(
+    update_selected_security,
+    names="value",
+)
+
+call_strike_input.observe(
+    update_selected_security,
+    names="value",
+)
+
+shares_input.observe(
+    update_selected_security,
+    names="value",
+)
+
+
+# ------------------------------------------------------------
+# 21. BUILD CONTROL PANEL
+# ------------------------------------------------------------
+
+control_buttons = widgets.HBox(
+    [
+        reset_button,
+        export_button,
+    ],
+    layout=widgets.Layout(
+        width="340px",
+        justify_content="space-between",
+    ),
+)
+
+
+controls_panel = widgets.VBox(
+    [
+        section_header("UNIVERSE"),
+        ticker_input,
+
+        section_header("DISPLAY"),
+        top_n_input,
+
+        section_header("FACTOR WEIGHTS"),
+        high_weight_input,
+        volatility_weight_input,
+        return_weight_input,
+        liquidity_weight_input,
+        weight_total_widget,
+
+        section_header("COLLAR ASSUMPTIONS"),
+        put_strike_input,
+        call_strike_input,
+        shares_input,
+
+        widgets.HTML(
+            value="<div style='height:8px;'></div>"
+        ),
+
+        run_button,
+        control_buttons,
+        status_widget,
+        message_output,
+    ],
+    layout=widgets.Layout(
+        width="375px",
+        min_width="375px",
+        padding="12px",
+        border=f"1px solid {COLORS['border']}",
+        background_color=COLORS["panel"],
+    ),
+)
+
+
+# ------------------------------------------------------------
+# 22. BUILD MAIN RESULTS TABS
+# ------------------------------------------------------------
+
+screen_tabs = widgets.Tab(
+    children=[
+        table_output,
+        ranking_output,
+    ],
+    layout=widgets.Layout(
+        width="100%",
+    ),
+)
+
+screen_tabs.set_title(
+    0,
+    "Opportunity Monitor",
+)
+
+screen_tabs.set_title(
+    1,
+    "Ranking Chart",
+)
+
+
+security_analysis_tabs = widgets.Tab(
+    children=[
+        payoff_output,
+        factor_output,
+        scenario_output,
+    ],
+    layout=widgets.Layout(
+        width="100%",
+    ),
+)
+
+security_analysis_tabs.set_title(
+    0,
+    "Collar Payoff",
+)
+
+security_analysis_tabs.set_title(
+    1,
+    "Factor Profile",
+)
+
+security_analysis_tabs.set_title(
+    2,
+    "Scenario Table",
+)
+
+
+selected_security_panel = widgets.VBox(
+    [
+        widgets.HTML(
+            value=f"""
+            <div style="
+                color:{COLORS['yellow']};
+                font-size:15px;
+                font-weight:700;
+                margin-top:12px;
+                margin-bottom:8px;
+            ">
+                SELECTED SECURITY ANALYSIS
+            </div>
+            """
+        ),
+        security_selector,
+        security_summary_output,
+        security_analysis_tabs,
+    ],
+    layout=widgets.Layout(
+        width="100%",
+    ),
+)
+
+
+main_results_panel = widgets.VBox(
+    [
+        screen_tabs,
+        selected_security_panel,
+    ],
+    layout=widgets.Layout(
+        width="calc(100% - 390px)",
+        padding="0 0 0 12px",
+    ),
+)
+
+
+# ------------------------------------------------------------
+# 23. ASSEMBLE APPLICATION
+# ------------------------------------------------------------
+
+dashboard_body = widgets.HBox(
+    [
+        controls_panel,
+        main_results_panel,
+    ],
+    layout=widgets.Layout(
+        width="100%",
+        align_items="flex-start",
+    ),
+)
+
+
+disclaimer_widget = widgets.HTML(
+    value=f"""
+    <div style="
+        background:{COLORS['background']};
+        border:1px solid {COLORS['border']};
+        color:{COLORS['muted']};
+        font-size:10px;
+        padding:8px 12px;
+        margin-top:8px;
+        font-family:Arial, sans-serif;
+    ">
+        Illustrative idea-generation tool only. Outputs are not executable
+        pricing, investment advice, a client recommendation or an indication
+        of transaction feasibility. Results exclude option premiums,
+        dividends, financing costs, stock borrow, taxes, transaction costs
+        and counterparty adjustments.
+    </div>
+    """
+)
+
+
+dashboard = widgets.VBox(
+    [
+        header_widget,
+        dashboard_body,
+        disclaimer_widget,
+    ],
+    layout=widgets.Layout(
+        width="100%",
+        background_color=COLORS["background"],
+    ),
+)
+
+
+# ------------------------------------------------------------
+# 24. DISPLAY APPLICATION
+# ------------------------------------------------------------
+
+display(
+    dashboard
+)
