@@ -1,0 +1,486 @@
+# ============================================================
+# BQUANT / BQL FIELD SMOKE TEST
+#
+# Tests Bloomberg calls one at a time so one broken field
+# does not stop the rest of the notebook.
+# ============================================================
+
+import bql
+import pandas as pd
+import traceback
+from IPython.display import display
+
+
+# ------------------------------------------------------------
+# 1. CONNECT TO BQL
+# ------------------------------------------------------------
+
+bq = bql.Service()
+
+TEST_TICKER = "AAPL US Equity"
+TEST_UNIVERSE = bq.univ.list([TEST_TICKER])
+
+print("BQL service created successfully.")
+print(f"Testing Bloomberg calls using: {TEST_TICKER}")
+
+
+# ------------------------------------------------------------
+# 2. HELPER FUNCTION
+# ------------------------------------------------------------
+
+test_results = []
+
+
+def run_bql_test(
+    test_name,
+    item_builder,
+    universe=TEST_UNIVERSE,
+    show_rows=5,
+):
+    """
+    Build and execute one BQL field request.
+
+    item_builder must be a function with no arguments that returns
+    a BQL data item, for example:
+
+        lambda: bq.data.px_last()
+    """
+
+    print("\n" + "=" * 70)
+    print(f"TEST: {test_name}")
+    print("=" * 70)
+
+    try:
+        # Build the field separately so syntax errors are caught.
+        item = item_builder()
+
+        request = bql.Request(
+            universe,
+            {
+                test_name: item
+            },
+        )
+
+        response = bq.execute(request)
+
+        dataframe = bql.combined_df(
+            response
+        ).reset_index()
+
+        print("STATUS: PASS")
+        print(f"Rows returned: {len(dataframe)}")
+        print("Columns returned:")
+        print(dataframe.columns.tolist())
+
+        if dataframe.empty:
+            print("WARNING: Request succeeded but returned no rows.")
+        else:
+            display(dataframe.head(show_rows))
+
+        non_null_count = 0
+
+        if not dataframe.empty:
+            candidate_columns = [
+                column
+                for column in dataframe.columns
+                if str(column).lower()
+                not in {
+                    "id",
+                    "date",
+                    "currency",
+                    "secondary_name",
+                    "revision_date",
+                }
+            ]
+
+            for column in candidate_columns:
+                non_null_count += dataframe[column].notna().sum()
+
+        test_results.append(
+            {
+                "Test": test_name,
+                "Status": "PASS",
+                "Rows": len(dataframe),
+                "Non-Null Values": non_null_count,
+                "Error": "",
+            }
+        )
+
+        return dataframe
+
+    except Exception as error:
+
+        print("STATUS: FAIL")
+        print("Error type:", type(error).__name__)
+        print("Error message:")
+        print(str(error))
+
+        test_results.append(
+            {
+                "Test": test_name,
+                "Status": "FAIL",
+                "Rows": 0,
+                "Non-Null Values": 0,
+                "Error": str(error),
+            }
+        )
+
+        return None
+
+
+# ------------------------------------------------------------
+# 3. BASIC REFERENCE-DATA TESTS
+# ------------------------------------------------------------
+
+name_test = run_bql_test(
+    "Name",
+    lambda: bq.data.name(),
+)
+
+price_test = run_bql_test(
+    "Last Price",
+    lambda: bq.data.px_last(),
+)
+
+market_cap_test = run_bql_test(
+    "Market Capitalization",
+    lambda: bq.data.cur_mkt_cap(),
+)
+
+
+# ------------------------------------------------------------
+# 4. 52-WEEK HIGH TEST
+# ------------------------------------------------------------
+
+high_52week_test = run_bql_test(
+    "52 Week High",
+    lambda: bq.data.high_52week(),
+)
+
+
+# ------------------------------------------------------------
+# 5. CURRENT VOLUME TEST
+# ------------------------------------------------------------
+
+current_volume_test = run_bql_test(
+    "Current Volume",
+    lambda: bq.data.px_volume(),
+)
+
+
+# ------------------------------------------------------------
+# 6. HISTORICAL PRICE TEST
+# ------------------------------------------------------------
+
+historical_date_range = bq.func.range(
+    "-30D",
+    "0D",
+)
+
+historical_price_test = run_bql_test(
+    "Historical Price",
+    lambda: bq.data.px_last(
+        dates=historical_date_range,
+    ),
+    show_rows=10,
+)
+
+
+# ------------------------------------------------------------
+# 7. HISTORICAL VOLUME TEST
+# ------------------------------------------------------------
+
+historical_volume_test = run_bql_test(
+    "Historical Volume",
+    lambda: bq.data.px_volume(
+        dates=historical_date_range,
+    ),
+    show_rows=10,
+)
+
+
+# ------------------------------------------------------------
+# 8. HISTORICAL PRICE WITH FILL TEST
+# ------------------------------------------------------------
+
+historical_price_fill_test = run_bql_test(
+    "Historical Price Fill Previous",
+    lambda: bq.data.px_last(
+        dates=historical_date_range,
+        fill="prev",
+    ),
+    show_rows=10,
+)
+
+
+# ------------------------------------------------------------
+# 9. VOLUME WITH FILL TEST
+#
+# This is included only as a diagnostic.
+# You generally should not forward-fill volume in the final model.
+# ------------------------------------------------------------
+
+historical_volume_fill_test = run_bql_test(
+    "Historical Volume Fill Previous",
+    lambda: bq.data.px_volume(
+        dates=historical_date_range,
+        fill="prev",
+    ),
+    show_rows=10,
+)
+
+
+# ------------------------------------------------------------
+# 10. VOLATILITY FIELD TEST
+# ------------------------------------------------------------
+
+volatility_test = run_bql_test(
+    "Volatility",
+    lambda: bq.data.volatility(),
+)
+
+
+# ------------------------------------------------------------
+# 11. AVERAGE VOLUME FIELD TEST
+#
+# This tests whether your environment recognizes volume_avg.
+# ------------------------------------------------------------
+
+average_volume_test = run_bql_test(
+    "Average Volume",
+    lambda: bq.data.volume_avg(),
+)
+
+
+# ------------------------------------------------------------
+# 12. EARNINGS-DATE TEST
+# ------------------------------------------------------------
+
+earnings_date_test = run_bql_test(
+    "Earnings Announcement Date",
+    lambda: bq.data.earnings_announcement_date(),
+)
+
+
+# ------------------------------------------------------------
+# 13. MULTI-SECURITY TEST
+# ------------------------------------------------------------
+
+multi_ticker_universe = bq.univ.list(
+    [
+        "AAPL US Equity",
+        "MSFT US Equity",
+        "AMZN US Equity",
+        "NVDA US Equity",
+        "EQIX US Equity",
+    ]
+)
+
+multi_security_price_test = run_bql_test(
+    "Multi Security Price",
+    lambda: bq.data.px_last(),
+    universe=multi_ticker_universe,
+    show_rows=10,
+)
+
+
+# ------------------------------------------------------------
+# 14. MULTI-FIELD REQUEST TEST
+# ------------------------------------------------------------
+
+print("\n" + "=" * 70)
+print("TEST: Multi-Field Request")
+print("=" * 70)
+
+try:
+    multi_field_request = bql.Request(
+        multi_ticker_universe,
+        {
+            "Name": bq.data.name(),
+            "Price": bq.data.px_last(),
+            "Volume": bq.data.px_volume(),
+            "Market Cap": bq.data.cur_mkt_cap(),
+        },
+    )
+
+    multi_field_response = bq.execute(
+        multi_field_request
+    )
+
+    multi_field_df = bql.combined_df(
+        multi_field_response
+    ).reset_index()
+
+    print("STATUS: PASS")
+    print("Rows returned:", len(multi_field_df))
+    print("Columns returned:")
+    print(multi_field_df.columns.tolist())
+
+    display(multi_field_df.head(10))
+
+    test_results.append(
+        {
+            "Test": "Multi-Field Request",
+            "Status": "PASS",
+            "Rows": len(multi_field_df),
+            "Non-Null Values": (
+                multi_field_df.notna().sum().sum()
+            ),
+            "Error": "",
+        }
+    )
+
+except Exception as error:
+
+    print("STATUS: FAIL")
+    print("Error type:", type(error).__name__)
+    print("Error message:")
+    print(str(error))
+
+    test_results.append(
+        {
+            "Test": "Multi-Field Request",
+            "Status": "FAIL",
+            "Rows": 0,
+            "Non-Null Values": 0,
+            "Error": str(error),
+        }
+    )
+
+
+# ------------------------------------------------------------
+# 15. HISTORICAL PRICE AND VOLUME SEPARATE REQUEST TEST
+# ------------------------------------------------------------
+
+print("\n" + "=" * 70)
+print("TEST: Separate Historical Price and Volume Requests")
+print("=" * 70)
+
+try:
+    price_request = bql.Request(
+        multi_ticker_universe,
+        {
+            "Price": bq.data.px_last(
+                dates=historical_date_range,
+            )
+        },
+    )
+
+    volume_request = bql.Request(
+        multi_ticker_universe,
+        {
+            "Volume": bq.data.px_volume(
+                dates=historical_date_range,
+            )
+        },
+    )
+
+    price_response = bq.execute(price_request)
+    volume_response = bq.execute(volume_request)
+
+    price_df = bql.combined_df(
+        price_response
+    ).reset_index()
+
+    volume_df = bql.combined_df(
+        volume_response
+    ).reset_index()
+
+    print("STATUS: PASS")
+
+    print("\nPrice response:")
+    print("Rows:", len(price_df))
+    print("Columns:", price_df.columns.tolist())
+    display(price_df.head(10))
+
+    print("\nVolume response:")
+    print("Rows:", len(volume_df))
+    print("Columns:", volume_df.columns.tolist())
+    display(volume_df.head(10))
+
+    test_results.append(
+        {
+            "Test": "Separate Historical Price and Volume",
+            "Status": "PASS",
+            "Rows": len(price_df) + len(volume_df),
+            "Non-Null Values": (
+                price_df.notna().sum().sum()
+                + volume_df.notna().sum().sum()
+            ),
+            "Error": "",
+        }
+    )
+
+except Exception as error:
+
+    print("STATUS: FAIL")
+    print("Error type:", type(error).__name__)
+    print("Error message:")
+    print(str(error))
+
+    test_results.append(
+        {
+            "Test": "Separate Historical Price and Volume",
+            "Status": "FAIL",
+            "Rows": 0,
+            "Non-Null Values": 0,
+            "Error": str(error),
+        }
+    )
+
+
+# ------------------------------------------------------------
+# 16. FINAL TEST SUMMARY
+# ------------------------------------------------------------
+
+summary_df = pd.DataFrame(test_results)
+
+print("\n" + "=" * 70)
+print("BQL FIELD TEST SUMMARY")
+print("=" * 70)
+
+display(summary_df)
+
+
+passed = (
+    summary_df["Status"]
+    .eq("PASS")
+    .sum()
+)
+
+failed = (
+    summary_df["Status"]
+    .eq("FAIL")
+    .sum()
+)
+
+print(f"\nPassed: {passed}")
+print(f"Failed: {failed}")
+
+
+# ------------------------------------------------------------
+# 17. LIST FAILED COMMANDS
+# ------------------------------------------------------------
+
+failed_tests = summary_df[
+    summary_df["Status"] == "FAIL"
+]
+
+if failed_tests.empty:
+
+    print(
+        "\nAll tested BQL calls passed."
+    )
+
+else:
+
+    print("\nThe following tests failed:")
+
+    display(
+        failed_tests[
+            [
+                "Test",
+                "Error",
+            ]
+        ]
+    )
