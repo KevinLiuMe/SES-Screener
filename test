@@ -1,0 +1,940 @@
+# ============================================================
+# STRATEGIC EQUITY SOLUTIONS — COLLAR OPPORTUNITY SCREENER
+# BQuant / BQL MVP
+#
+# Purpose:
+#   Rank stocks that may be interesting for concentrated-holder
+#   hedging, collar, monetization, or call-overwrite discussions.
+#
+# Initial signals:
+#   1. Proximity to 52-week high
+#   2. 20-day realized volatility
+#   3. Recent stock performance
+#   4. Average trading liquidity
+#
+# Important:
+#   - This is an idea-generation tool, not executable pricing.
+#   - Use only approved/public data and approved ticker universes.
+# ============================================================
+
+
+# -----------------------------
+# 1. IMPORT PACKAGES
+# -----------------------------
+
+import bql
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from IPython.display import display
+
+
+# -----------------------------
+# 2. CONNECT TO BQL
+# -----------------------------
+
+bq = bql.Service()
+
+print("BQL service connected.")
+
+
+# -----------------------------
+# 3. USER SETTINGS
+# -----------------------------
+
+# Start with a small universe.
+# Expand only after confirming that the data request works.
+
+TICKERS = [
+    "AAPL US Equity",
+    "MSFT US Equity",
+    "AMZN US Equity",
+    "META US Equity",
+    "NVDA US Equity",
+    "GOOGL US Equity",
+    "TSLA US Equity",
+    "EQIX US Equity",
+    "CRM US Equity",
+    "AVGO US Equity",
+]
+
+# Screening weights must add to 1.00.
+
+WEIGHTS = {
+    "high_proximity": 0.35,
+    "realized_volatility": 0.35,
+    "recent_return": 0.15,
+    "liquidity": 0.15,
+}
+
+# Number of top candidates to display.
+
+TOP_N = 10
+
+# Collar assumptions used for the selected-name payoff chart.
+
+DEFAULT_PUT_STRIKE_PCT = 0.90
+DEFAULT_CALL_STRIKE_PCT = 1.15
+DEFAULT_SHARES = 1_000_000
+
+
+# -----------------------------
+# 4. HELPER FUNCTIONS
+# -----------------------------
+
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert multi-index or irregular Bloomberg column names
+    into simple strings.
+    """
+    output = df.copy()
+
+    if isinstance(output.columns, pd.MultiIndex):
+        output.columns = [
+            "_".join(
+                str(item).strip()
+                for item in column
+                if str(item).strip() not in ("", "None")
+            )
+            for column in output.columns
+        ]
+    else:
+        output.columns = [str(column).strip() for column in output.columns]
+
+    return output
+
+
+def identify_column(
+    columns,
+    possible_terms,
+    exclude_terms=None,
+):
+    """
+    Search column names for likely matches.
+
+    Bloomberg response column names can vary slightly by environment.
+    """
+    exclude_terms = exclude_terms or []
+
+    for column in columns:
+        normalized = str(column).lower()
+
+        contains_required_term = any(
+            term.lower() in normalized
+            for term in possible_terms
+        )
+
+        contains_excluded_term = any(
+            term.lower() in normalized
+            for term in exclude_terms
+        )
+
+        if contains_required_term and not contains_excluded_term:
+            return column
+
+    return None
+
+
+def percentile_score(
+    series: pd.Series,
+    higher_is_better: bool = True,
+) -> pd.Series:
+    """
+    Convert a numeric series into a percentile score from 0 to 100.
+    """
+    numeric = pd.to_numeric(series, errors="coerce")
+
+    score = numeric.rank(
+        pct=True,
+        method="average",
+    ) * 100
+
+    if not higher_is_better:
+        score = 100 - score
+
+    return score
+
+
+def annualized_realized_volatility(
+    returns: pd.Series,
+    window: int = 20,
+) -> float:
+    """
+    Calculate annualized realized volatility from daily returns.
+    """
+    clean_returns = returns.dropna()
+
+    if len(clean_returns) < window:
+        return np.nan
+
+    recent_returns = clean_returns.tail(window)
+
+    return recent_returns.std(ddof=1) * np.sqrt(252)
+
+
+def safe_float(value, default=np.nan):
+    """
+    Convert a value to float without breaking the program.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def create_reason(row: pd.Series) -> str:
+    """
+    Produce a readable explanation for why a company was flagged.
+    """
+    reasons = []
+
+    below_high = row.get("Pct_Below_52W_High")
+    vol_score = row.get("Volatility_Score")
+    return_3m = row.get("Return_3M")
+    liquidity_score = row.get("Liquidity_Score")
+
+    if pd.notna(below_high):
+        if below_high <= 3:
+            reasons.append(
+                f"only {below_high:.1f}% below its 52-week high"
+            )
+        elif below_high <= 10:
+            reasons.append(
+                f"{below_high:.1f}% below its 52-week high"
+            )
+
+    if pd.notna(vol_score) and vol_score >= 75:
+        reasons.append("elevated realized volatility")
+
+    if pd.notna(return_3m):
+        if return_3m >= 0.20:
+            reasons.append(
+                f"strong three-month return of {return_3m:.1%}"
+            )
+        elif return_3m <= -0.20:
+            reasons.append(
+                f"large three-month decline of {return_3m:.1%}"
+            )
+
+    if pd.notna(liquidity_score) and liquidity_score >= 75:
+        reasons.append("strong trading liquidity")
+
+    if not reasons:
+        return "No unusually strong screening signal."
+
+    return "; ".join(reasons).capitalize() + "."
+
+
+def collar_payoff(
+    spot: float,
+    put_strike: float,
+    call_strike: float,
+    shares: float = 1.0,
+    put_premium: float = 0.0,
+    call_premium: float = 0.0,
+    lower_spot_multiplier: float = 0.50,
+    upper_spot_multiplier: float = 1.50,
+    number_of_points: int = 301,
+) -> pd.DataFrame:
+    """
+    Calculate terminal values for:
+
+        Long stock
+        + Long put
+        - Short call
+
+    Premiums are per share.
+
+    This is an illustrative terminal-payoff model and does not include:
+        - Financing
+        - Dividends
+        - Stock borrow
+        - Taxes
+        - Early exercise
+        - Counterparty adjustments
+        - Transaction costs
+    """
+    terminal_prices = np.linspace(
+        spot * lower_spot_multiplier,
+        spot * upper_spot_multiplier,
+        number_of_points,
+    )
+
+    stock_terminal_value = terminal_prices
+
+    long_put_value = np.maximum(
+        put_strike - terminal_prices,
+        0,
+    )
+
+    short_call_value = -np.maximum(
+        terminal_prices - call_strike,
+        0,
+    )
+
+    net_option_premium = call_premium - put_premium
+
+    collar_value_per_share = (
+        stock_terminal_value
+        + long_put_value
+        + short_call_value
+        + net_option_premium
+    )
+
+    return pd.DataFrame(
+        {
+            "Terminal_Stock_Price": terminal_prices,
+            "Unhedged_Value": terminal_prices * shares,
+            "Collar_Value": collar_value_per_share * shares,
+            "Put_Value": long_put_value * shares,
+            "Short_Call_Value": short_call_value * shares,
+        }
+    )
+
+
+# -----------------------------
+# 5. CREATE BLOOMBERG UNIVERSE
+# -----------------------------
+
+universe = bq.univ.list(TICKERS)
+
+
+# -----------------------------
+# 6. REQUEST HISTORICAL DATA
+# -----------------------------
+#
+# We request one year of:
+#   - Last price
+#   - Trading volume
+#
+# If "px_volume" is not recognized in your BQuant environment,
+# type:
+#
+#     bq.data.
+#
+# and press Tab, then search for "volume".
+# -----------------------------
+
+date_range = bq.func.range("-1Y", "0D")
+
+historical_items = {
+    "Price": bq.data.px_last(
+        dates=date_range,
+        fill="prev",
+    ),
+    "Volume": bq.data.px_volume(
+        dates=date_range,
+        fill="prev",
+    ),
+}
+
+historical_request = bql.Request(
+    universe,
+    historical_items,
+)
+
+print("Requesting Bloomberg historical data...")
+
+historical_response = bq.execute(historical_request)
+
+historical_df = bql.combined_df(
+    historical_response
+).reset_index()
+
+historical_df = flatten_columns(historical_df)
+
+print("Historical data returned.")
+print("Returned columns:")
+print(historical_df.columns.tolist())
+
+
+# -----------------------------
+# 7. IDENTIFY RETURNED COLUMNS
+# -----------------------------
+
+ticker_column = identify_column(
+    historical_df.columns,
+    possible_terms=[
+        "id",
+        "security",
+        "ticker",
+    ],
+    exclude_terms=[
+        "currency",
+    ],
+)
+
+date_column = identify_column(
+    historical_df.columns,
+    possible_terms=[
+        "date",
+    ],
+)
+
+price_column = identify_column(
+    historical_df.columns,
+    possible_terms=[
+        "price",
+        "px_last",
+    ],
+)
+
+volume_column = identify_column(
+    historical_df.columns,
+    possible_terms=[
+        "volume",
+        "px_volume",
+    ],
+)
+
+if ticker_column is None:
+    raise ValueError(
+        "Could not identify the ticker/security column. "
+        f"Returned columns were: {historical_df.columns.tolist()}"
+    )
+
+if date_column is None:
+    raise ValueError(
+        "Could not identify the date column. "
+        f"Returned columns were: {historical_df.columns.tolist()}"
+    )
+
+if price_column is None:
+    raise ValueError(
+        "Could not identify the price column. "
+        f"Returned columns were: {historical_df.columns.tolist()}"
+    )
+
+if volume_column is None:
+    raise ValueError(
+        "Could not identify the volume column. "
+        "Check the Bloomberg volume field name using BQL autocomplete. "
+        f"Returned columns were: {historical_df.columns.tolist()}"
+    )
+
+print("\nDetected columns:")
+print(f"Ticker: {ticker_column}")
+print(f"Date:   {date_column}")
+print(f"Price:  {price_column}")
+print(f"Volume: {volume_column}")
+
+
+# -----------------------------
+# 8. CLEAN HISTORICAL DATA
+# -----------------------------
+
+history = historical_df[
+    [
+        ticker_column,
+        date_column,
+        price_column,
+        volume_column,
+    ]
+].copy()
+
+history.columns = [
+    "Ticker",
+    "Date",
+    "Price",
+    "Volume",
+]
+
+history["Date"] = pd.to_datetime(
+    history["Date"],
+    errors="coerce",
+)
+
+history["Price"] = pd.to_numeric(
+    history["Price"],
+    errors="coerce",
+)
+
+history["Volume"] = pd.to_numeric(
+    history["Volume"],
+    errors="coerce",
+)
+
+history = history.dropna(
+    subset=[
+        "Ticker",
+        "Date",
+        "Price",
+    ]
+)
+
+history = history.sort_values(
+    [
+        "Ticker",
+        "Date",
+    ]
+)
+
+# Occasionally a Bloomberg response can contain duplicate observations.
+history = history.drop_duplicates(
+    subset=[
+        "Ticker",
+        "Date",
+    ],
+    keep="last",
+)
+
+print(f"\nUsable historical observations: {len(history):,}")
+print(f"Usable securities: {history['Ticker'].nunique():,}")
+
+
+# -----------------------------
+# 9. CALCULATE SECURITY METRICS
+# -----------------------------
+
+security_metrics = []
+
+for ticker, ticker_history in history.groupby("Ticker"):
+
+    ticker_history = ticker_history.sort_values("Date").copy()
+
+    prices = ticker_history["Price"].dropna()
+    volumes = ticker_history["Volume"].dropna()
+
+    if len(prices) < 30:
+        print(
+            f"Skipping {ticker}: "
+            f"only {len(prices)} usable price observations."
+        )
+        continue
+
+    current_price = prices.iloc[-1]
+    high_52_week = prices.max()
+    low_52_week = prices.min()
+
+    pct_below_high = (
+        (high_52_week - current_price)
+        / high_52_week
+    ) * 100
+
+    daily_returns = prices.pct_change()
+
+    realized_vol_20d = annualized_realized_volatility(
+        daily_returns,
+        window=20,
+    )
+
+    realized_vol_60d = annualized_realized_volatility(
+        daily_returns,
+        window=60,
+    )
+
+    # Approximately 21 trading days per month.
+    if len(prices) >= 64:
+        return_3m = (
+            current_price / prices.iloc[-64]
+        ) - 1
+    else:
+        return_3m = np.nan
+
+    if len(prices) >= 127:
+        return_6m = (
+            current_price / prices.iloc[-127]
+        ) - 1
+    else:
+        return_6m = np.nan
+
+    if len(prices) >= 252:
+        return_1y = (
+            current_price / prices.iloc[-252]
+        ) - 1
+    else:
+        return_1y = (
+            current_price / prices.iloc[0]
+        ) - 1
+
+    average_volume_20d = (
+        volumes.tail(20).mean()
+        if len(volumes) > 0
+        else np.nan
+    )
+
+    average_volume_60d = (
+        volumes.tail(60).mean()
+        if len(volumes) > 0
+        else np.nan
+    )
+
+    average_daily_value_traded_20d = (
+        ticker_history
+        .assign(
+            Daily_Value_Traded=(
+                ticker_history["Price"]
+                * ticker_history["Volume"]
+            )
+        )["Daily_Value_Traded"]
+        .dropna()
+        .tail(20)
+        .mean()
+    )
+
+    security_metrics.append(
+        {
+            "Ticker": ticker,
+            "Price": current_price,
+            "52W_High": high_52_week,
+            "52W_Low": low_52_week,
+            "Pct_Below_52W_High": pct_below_high,
+            "Realized_Vol_20D": realized_vol_20d,
+            "Realized_Vol_60D": realized_vol_60d,
+            "Return_3M": return_3m,
+            "Return_6M": return_6m,
+            "Return_1Y": return_1y,
+            "Average_Volume_20D": average_volume_20d,
+            "Average_Volume_60D": average_volume_60d,
+            "Average_Daily_Value_Traded_20D": (
+                average_daily_value_traded_20d
+            ),
+            "Last_Data_Date": ticker_history["Date"].max(),
+            "Observation_Count": len(prices),
+        }
+    )
+
+metrics = pd.DataFrame(security_metrics)
+
+if metrics.empty:
+    raise ValueError(
+        "No usable security metrics were produced. "
+        "Inspect the historical Bloomberg response and field names."
+    )
+
+
+# -----------------------------
+# 10. CREATE FACTOR SCORES
+# -----------------------------
+
+# Stocks closer to their 52-week highs receive higher scores.
+metrics["High_Proximity_Score"] = percentile_score(
+    metrics["Pct_Below_52W_High"],
+    higher_is_better=False,
+)
+
+# Higher realized volatility receives a higher score.
+metrics["Volatility_Score"] = percentile_score(
+    metrics["Realized_Vol_20D"],
+    higher_is_better=True,
+)
+
+# Stronger three-month returns receive higher scores.
+metrics["Recent_Return_Score"] = percentile_score(
+    metrics["Return_3M"],
+    higher_is_better=True,
+)
+
+# Higher average daily dollar trading volume receives a higher score.
+metrics["Liquidity_Score"] = percentile_score(
+    metrics["Average_Daily_Value_Traded_20D"],
+    higher_is_better=True,
+)
+
+
+# -----------------------------
+# 11. CREATE OPPORTUNITY SCORE
+# -----------------------------
+
+metrics["Opportunity_Score"] = (
+    WEIGHTS["high_proximity"]
+    * metrics["High_Proximity_Score"]
+    +
+    WEIGHTS["realized_volatility"]
+    * metrics["Volatility_Score"]
+    +
+    WEIGHTS["recent_return"]
+    * metrics["Recent_Return_Score"]
+    +
+    WEIGHTS["liquidity"]
+    * metrics["Liquidity_Score"]
+)
+
+
+# -----------------------------
+# 12. ADD READABLE EXPLANATIONS
+# -----------------------------
+
+metrics["Why_Flagged"] = metrics.apply(
+    create_reason,
+    axis=1,
+)
+
+
+# -----------------------------
+# 13. RANK THE RESULTS
+# -----------------------------
+
+results = metrics.sort_values(
+    "Opportunity_Score",
+    ascending=False,
+).reset_index(drop=True)
+
+results.index = results.index + 1
+results.index.name = "Rank"
+
+
+# -----------------------------
+# 14. FORMAT DISPLAY TABLE
+# -----------------------------
+
+display_results = results[
+    [
+        "Ticker",
+        "Price",
+        "Pct_Below_52W_High",
+        "Realized_Vol_20D",
+        "Return_3M",
+        "Average_Daily_Value_Traded_20D",
+        "Opportunity_Score",
+        "Why_Flagged",
+    ]
+].copy()
+
+display_results["Price"] = display_results["Price"].round(2)
+
+display_results["Pct_Below_52W_High"] = (
+    display_results["Pct_Below_52W_High"].round(1)
+)
+
+display_results["Realized_Vol_20D"] = (
+    display_results["Realized_Vol_20D"] * 100
+).round(1)
+
+display_results["Return_3M"] = (
+    display_results["Return_3M"] * 100
+).round(1)
+
+display_results["Average_Daily_Value_Traded_20D"] = (
+    display_results["Average_Daily_Value_Traded_20D"]
+    / 1_000_000
+).round(1)
+
+display_results["Opportunity_Score"] = (
+    display_results["Opportunity_Score"].round(1)
+)
+
+display_results = display_results.rename(
+    columns={
+        "Pct_Below_52W_High": "% Below 52W High",
+        "Realized_Vol_20D": "20D Realized Vol (%)",
+        "Return_3M": "3M Return (%)",
+        "Average_Daily_Value_Traded_20D": (
+            "20D Avg Daily Value Traded ($mm)"
+        ),
+        "Opportunity_Score": "Opportunity Score",
+        "Why_Flagged": "Why Flagged",
+    }
+)
+
+print("\nTOP STRATEGIC EQUITY OPPORTUNITY CANDIDATES")
+display(display_results.head(TOP_N))
+
+
+# -----------------------------
+# 15. OPPORTUNITY SCORE BAR CHART
+# -----------------------------
+
+chart_results = results.head(TOP_N).sort_values(
+    "Opportunity_Score",
+    ascending=True,
+)
+
+score_chart = go.Figure()
+
+score_chart.add_trace(
+    go.Bar(
+        x=chart_results["Opportunity_Score"],
+        y=chart_results["Ticker"],
+        orientation="h",
+        text=chart_results["Opportunity_Score"].round(1),
+        textposition="outside",
+        customdata=chart_results[
+            [
+                "Pct_Below_52W_High",
+                "Realized_Vol_20D",
+                "Return_3M",
+                "Why_Flagged",
+            ]
+        ],
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Opportunity score: %{x:.1f}<br>"
+            "Below 52W high: %{customdata[0]:.1f}%<br>"
+            "20D realized vol: %{customdata[1]:.1%}<br>"
+            "Three-month return: %{customdata[2]:.1%}<br>"
+            "%{customdata[3]}"
+            "<extra></extra>"
+        ),
+    )
+)
+
+score_chart.update_layout(
+    title="Strategic Equity Opportunity Ranking",
+    xaxis_title="Opportunity Score",
+    yaxis_title="Security",
+    height=max(450, TOP_N * 45),
+    margin=dict(
+        l=120,
+        r=60,
+        t=80,
+        b=60,
+    ),
+)
+
+score_chart.show()
+
+
+# -----------------------------
+# 16. SELECT TOP NAME FOR COLLAR
+# -----------------------------
+
+selected_ticker = results.iloc[0]["Ticker"]
+selected_spot = safe_float(results.iloc[0]["Price"])
+
+put_strike = selected_spot * DEFAULT_PUT_STRIKE_PCT
+call_strike = selected_spot * DEFAULT_CALL_STRIKE_PCT
+
+print("\nILLUSTRATIVE COLLAR")
+print(f"Selected security: {selected_ticker}")
+print(f"Current stock price: {selected_spot:,.2f}")
+print(f"Illustrative put strike: {put_strike:,.2f}")
+print(f"Illustrative call strike: {call_strike:,.2f}")
+print(f"Illustrative shares: {DEFAULT_SHARES:,.0f}")
+
+
+# -----------------------------
+# 17. CALCULATE COLLAR PAYOFF
+# -----------------------------
+
+payoff = collar_payoff(
+    spot=selected_spot,
+    put_strike=put_strike,
+    call_strike=call_strike,
+    shares=DEFAULT_SHARES,
+    put_premium=0.0,
+    call_premium=0.0,
+)
+
+
+# -----------------------------
+# 18. PLOT COLLAR PAYOFF
+# -----------------------------
+
+payoff_chart = go.Figure()
+
+payoff_chart.add_trace(
+    go.Scatter(
+        x=payoff["Terminal_Stock_Price"],
+        y=payoff["Unhedged_Value"],
+        mode="lines",
+        name="Unhedged Stock Position",
+        hovertemplate=(
+            "Terminal stock price: %{x:,.2f}<br>"
+            "Position value: $%{y:,.0f}"
+            "<extra></extra>"
+        ),
+    )
+)
+
+payoff_chart.add_trace(
+    go.Scatter(
+        x=payoff["Terminal_Stock_Price"],
+        y=payoff["Collar_Value"],
+        mode="lines",
+        name="Illustrative Collar",
+        hovertemplate=(
+            "Terminal stock price: %{x:,.2f}<br>"
+            "Collar value: $%{y:,.0f}"
+            "<extra></extra>"
+        ),
+    )
+)
+
+payoff_chart.add_vline(
+    x=selected_spot,
+    line_dash="dot",
+    annotation_text="Current Price",
+    annotation_position="top",
+)
+
+payoff_chart.add_vline(
+    x=put_strike,
+    line_dash="dash",
+    annotation_text="Put Strike",
+    annotation_position="bottom left",
+)
+
+payoff_chart.add_vline(
+    x=call_strike,
+    line_dash="dash",
+    annotation_text="Call Strike",
+    annotation_position="bottom right",
+)
+
+payoff_chart.update_layout(
+    title=(
+        f"{selected_ticker}: Illustrative "
+        f"{DEFAULT_PUT_STRIKE_PCT:.0%}–"
+        f"{DEFAULT_CALL_STRIKE_PCT:.0%} Collar"
+    ),
+    xaxis_title="Stock Price at Maturity",
+    yaxis_title="Terminal Position Value",
+    hovermode="x unified",
+    height=600,
+)
+
+payoff_chart.show()
+
+
+# -----------------------------
+# 19. TERMINAL-SCENARIO TABLE
+# -----------------------------
+
+scenario_prices = [
+    selected_spot * 0.50,
+    selected_spot * 0.75,
+    put_strike,
+    selected_spot,
+    call_strike,
+    selected_spot * 1.25,
+    selected_spot * 1.50,
+]
+
+scenario_rows = []
+
+for terminal_price in scenario_prices:
+
+    stock_value = terminal_price * DEFAULT_SHARES
+
+    collar_value = (
+        terminal_price
+        + max(put_strike - terminal_price, 0)
+        - max(terminal_price - call_strike, 0)
+    ) * DEFAULT_SHARES
+
+    scenario_rows.append(
+        {
+            "Terminal Stock Price": terminal_price,
+            "Unhedged Position Value": stock_value,
+            "Collar Position Value": collar_value,
+            "Difference": collar_value - stock_value,
+        }
+    )
+
+scenario_table = pd.DataFrame(scenario_rows)
+
+scenario_table["Terminal Stock Price"] = (
+    scenario_table["Terminal Stock Price"].round(2)
+)
+
+for column in [
+    "Unhedged Position Value",
+    "Collar Position Value",
+    "Difference",
+]:
+    scenario_table[column] = scenario_table[column].round(0)
+
+print("\nILLUSTRATIVE TERMINAL-SCENARIO TABLE")
+display(scenario_table)
+
